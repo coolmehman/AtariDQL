@@ -32,7 +32,7 @@ import tensorflow as tf
 import datetime
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   Functions and Args
+#   Args
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 @dataclass
@@ -55,8 +55,7 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
-    #save_model: bool = True
-    save_model: bool = False
+    save_model: bool = True
     """whether to save model into the `runs/{run_name}` folder"""
     upload_model: bool = False
     """whether to upload the saved model to huggingface"""
@@ -167,6 +166,30 @@ ArgsDict = {
   #"""the frequency of the heatmap upload"""
 }
 
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   Functions
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# ALGO LOGIC: initialize agent here:
+class QNetwork(nn.Module):
+    def __init__(self, env):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Conv2d(4, 32, 8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(3136, 512),
+            nn.ReLU(),
+            nn.Linear(512, env.single_action_space.n),
+        )
+
+    def forward(self, x):
+        return self.network(x / 255.0)
+
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
         if capture_video and idx == 0:
@@ -191,32 +214,14 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
     return thunk
 
-# ALGO LOGIC: initialize agent here:
-class QNetwork(nn.Module):
-    def __init__(self, env):
-        super().__init__()
-        self.network = nn.Sequential(
-            nn.Conv2d(4, 32, 8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(3136, 512),
-            nn.ReLU(),
-            nn.Linear(512, env.single_action_space.n),
-        )
-
-    def forward(self, x):
-        return self.network(x / 255.0)
-
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     slope = (end_e - start_e) / duration
     return max(slope * t + start_e, end_e)
 
 
 def update_heatmap(curr_obs, comp_obs, q_network, dqn_heatmap):
+  #Curr_obs comp_obs naming somewhat innaccurate, curr_obs is the obs which the decision that is being measured comes from
+  #Should really add checks for obs's to see if they have that empty first layer (curr_obs[0] is actual data)
   device = torch.device("cuda" if torch.cuda.is_available() and Args.cuda else "cpu")
 
   #Scaling so that, accounting for how many times this
@@ -264,23 +269,100 @@ def update_heatmap(curr_obs, comp_obs, q_network, dqn_heatmap):
       column_count += 1
     row_count += 1
 
-  if(np.amax(dqn_heatmap) > 255.0):
-    scaling_factor = 255.0 / np.amax(dqn_heatmap)
-    #Scale heatmap values to 255, slightly depresses values that arent immediately relevant between the 
-    # two images, so try to avoid pushing values past a bit more than 255 in the previous loop
-    row_count = 0
-    for row in dqn_heatmap:
-      column_count = 0
-      for pixel in row:
-        dqn_heatmap[row_count][column_count] = pixel * scaling_factor
-        column_count += 1
-      row_count += 1
+  # if(np.amax(dqn_heatmap) > 255.0):
+  #   scaling_factor = 255.0 / np.amax(dqn_heatmap)
+  #   #Scale heatmap values to 255, slightly depresses values that arent immediately relevant between the 
+  #   # two images, so try to avoid pushing values past a bit more than 255 in the previous loop
+  #   row_count = 0
+  #   for row in dqn_heatmap:
+  #     column_count = 0
+  #     for pixel in row:
+  #       dqn_heatmap[row_count][column_count] = pixel * scaling_factor
+  #       column_count += 1
+  #     row_count += 1
 
   return dqn_heatmap
+
+def scale_arraymap(arraymap):
+  scaling_factor = 255.0 / np.amax(arraymap)
+  row_count = 0
+  for row in arraymap:
+    column_count = 0
+    for pixel in row:
+      arraymap[row_count][column_count] = pixel * scaling_factor
+      column_count += 1
+    row_count += 1
+  #Might want to change this to arraymap.copy() to ensure value, not pointer, is returned
+  return arraymap
+
+def evaluate(
+    model_path: str,
+    make_env: Callable,
+    env_id: str,
+    eval_episodes: int,
+    run_name: str,
+    Model: torch.nn.Module,
+    device: torch.device = torch.device("cpu"),
+    epsilon: float = 0.05,
+    capture_video: bool = True,
+    log_heatmaps: bool = False
+):
+    if log_heatmaps:
+      #single_eval_heatmaps will include heatmap and obs
+      single_eval_heatmaps = []
+      eval_heatmap = np.array([[0.0]*84]*84)
+
+    envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, 0, capture_video, run_name)])
+    model = Model(envs).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    obs, _ = envs.reset()
+    episodic_returns = []
+    while len(episodic_returns) < eval_episodes:
+        if random.random() < epsilon:
+            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+        else:
+            q_values = model(torch.Tensor(obs).to(device))
+            actions = torch.argmax(q_values, dim=1).cpu().numpy()
+        next_obs, _, _, _, infos = envs.step(actions)
+
+        if log_heatmaps:
+          #May want to mess with which obs's are used
+          #Current idea is that by comparing to previous obs,
+          # heatmap shows "moments" where decisions change
+          update_heatmap(obs[0], next_obs[0], model, eval_heatmap)
+
+          #Might be excessive .copy() with second one,
+          # unsure if the pointer or value is returned
+          eval_heatmap_obs = np.concatenate((scale_arraymap(eval_heatmap.copy()).copy(), next_obs[0][3].copy()), axis = 1)
+          
+          #These will be the individual frames when logged as video
+          single_eval_heatmaps.append([eval_heatmap_obs.copy()]*3)
+
+        if "final_info" in infos:
+            for info in infos["final_info"]:
+                if "episode" not in info:
+                  continue
+                elif log_heatmaps:
+                  #Log accumulated maps
+                  run.log({"video":wandb.Video(np.asarray(single_eval_heatmaps), caption="eval_heatmap", fps=4, format="mp4")})
+                  #Reset maps for next evaluation episode
+                  single_eval_heatmaps = []
+                  eval_heatmap = np.array([[0.0]*84]*84)
+                print(f"eval_episode={len(episodic_returns)}, episodic_return={info['episode']['r']}")
+                episodic_returns += [info["episode"]["r"]]
+        obs = next_obs
+
+    return episodic_returns
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   Main DQN Sequence
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+#final_obs = np.array([[[[0]*84] * 84]*4])
+#final_network;
 
 if __name__ == "__main__":
     import stable_baselines3 as sb3
@@ -394,8 +476,9 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
           rand_obs.append(obs)
 
         # ALGO LOGIC: training.
-        if global_step == Args.learning_starts:
-          comparison_obs = obs.copy()
+
+        # if global_step == Args.learning_starts:
+        #   comparison_obs = obs.copy()
 
         if global_step > Args.learning_starts:
             if global_step % Args.train_frequency == 0:
@@ -424,36 +507,32 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
                         Args.tau * q_network_param.data + (1.0 - Args.tau) * target_network_param.data
                     )
             
-            if global_step % Args.heatmap_frequency == 0:
-              update_heatmap(obs[0], comparison_obs[0], q_network, heatmap)
+            # if global_step % Args.heatmap_frequency == 0:
+            #   update_heatmap(obs[0], comparison_obs[0], q_network, heatmap)
 
-            if global_step % Args.heatmap_change_frequency == 0:
-              comparison_obs = obs.copy()
+            # if global_step % Args.heatmap_change_frequency == 0:
+            #   comparison_obs = obs.copy()
 
-            if global_step % Args.heatmap_upload_frequency == 0:
-              #AssertionError: size of input tensor and input format are different.
-              # tensor shape: (84, 84), input_format: CHW
-              #writer.add_image("heatmap", heatmap, global_step)
+            # if global_step % Args.heatmap_upload_frequency == 0:
+            #   #AssertionError: size of input tensor and input format are different.
+            #   # tensor shape: (84, 84), input_format: CHW
+            #   #writer.add_image("heatmap", heatmap, global_step)
 
-              #heatmaps.append(wandb.Image(heatmap, "L", caption=global_step))
-
-              #Append actual heatmap values rather than pointers to the final heatmap value
-              heatmaps.append([heatmap.copy()]*3)
+            #   #Append actual heatmap values rather than pointers to the final heatmap value
+            #   heatmaps.append([heatmap.copy()]*3)
 
     # for i in range(5):
     #   if np.all(rand_obs[i] == np.array([[[0]*84]*84]*4)):
     #     rand_obs[i] = obs.copy()
 
     # final_q_network = q_network
-    if Args.track:
-      run.log({"video":wandb.Video(np.asarray(heatmaps), caption="heatmap", fps=4, format="mp4")})
 
     if Args.save_model:
         model_path = f"runs/{run_name}/{Args.exp_name}.cleanrl_model"
         torch.save(q_network.state_dict(), model_path)
         print(f"model saved to {model_path}")
         #from cleanrl_utils.evals.dqn_eval import evaluate
-        from dqn_eval import evaluate
+        #from dqn_eval import evaluate
 
         episodic_returns = evaluate(
             model_path,
@@ -464,9 +543,16 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
             Model=QNetwork,
             device=device,
             epsilon=0.05,
+            capture_video= True,
+            log_heatmaps = True
         )
         for idx, episodic_return in enumerate(episodic_returns):
             writer.add_scalar("eval/episodic_return", episodic_return, idx)
+
+        # Moved to evaluate()
+        # if Args.track:
+        #   for eval_heatmaps in heatmaps:
+        #     run.log({"video":wandb.Video(np.asarray(eval_heatmaps), caption="heatmap", fps=4, format="mp4")})
 
         if Args.upload_model:
             from cleanrl_utils.huggingface import push_to_hub
