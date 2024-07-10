@@ -310,7 +310,8 @@ def evaluate(
     if log_heatmaps:
       #single_eval_heatmaps will include heatmap and obs
       single_eval_heatmaps = []
-      eval_heatmap = np.array([[0.0]*84]*84)
+      eval_heatmap = np.array([[255.0]*84]*84)
+      eval_steps = 0
 
     envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, 0, capture_video, run_name)])
     model = Model(envs).to(device)
@@ -318,6 +319,7 @@ def evaluate(
     model.eval()
 
     obs, _ = envs.reset()
+    prev_obs = obs.copy()
     episodic_returns = []
     while len(episodic_returns) < eval_episodes:
         if random.random() < epsilon:
@@ -327,15 +329,22 @@ def evaluate(
             actions = torch.argmax(q_values, dim=1).cpu().numpy()
         next_obs, _, _, _, infos = envs.step(actions)
 
+
+
         if log_heatmaps:
+          if (eval_steps % 50 == 0):
+            prev_obs = obs.copy()
+          eval_steps += 1;
+
           #May want to mess with which obs's are used
           #Current idea is that by comparing to previous obs,
           # heatmap shows "moments" where decisions change
-          update_heatmap(obs[0], next_obs[0], model, eval_heatmap)
+          update_heatmap(next_obs[0], prev_obs[0], model, eval_heatmap)
 
           #Might be excessive .copy() with second one,
           # unsure if the pointer or value is returned
-          eval_heatmap_obs = np.concatenate((scale_arraymap(eval_heatmap.copy()).copy(), next_obs[0][3].copy()), axis = 1)
+          eval_heatmap_obs = np.concatenate((prev_obs[0][3].copy(), scale_arraymap(eval_heatmap.copy()).copy()), axis = 1)
+          eval_heatmap_obs = np.concatenate((eval_heatmap_obs.copy(), next_obs[0][3].copy()), axis = 1)
           
           #These will be the individual frames when logged as video
           single_eval_heatmaps.append([eval_heatmap_obs.copy()]*3)
@@ -349,7 +358,8 @@ def evaluate(
                   run.log({"video":wandb.Video(np.asarray(single_eval_heatmaps), caption="eval_heatmap", fps=4, format="mp4")})
                   #Reset maps for next evaluation episode
                   single_eval_heatmaps = []
-                  eval_heatmap = np.array([[0.0]*84]*84)
+                  eval_heatmap = np.array([[255.0]*84]*84)
+                  eval_steps = 0
                 print(f"eval_episode={len(episodic_returns)}, episodic_return={info['episode']['r']}")
                 episodic_returns += [info["episode"]["r"]]
         obs = next_obs
@@ -359,10 +369,6 @@ def evaluate(
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   Main DQN Sequence
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-
-#final_obs = np.array([[[[0]*84] * 84]*4])
-#final_network;
 
 if __name__ == "__main__":
     import stable_baselines3 as sb3
